@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -152,6 +153,47 @@ public class SQLStatementUtilsTest {
             + "FROM metadata_entity_foo "
             + "WHERE urn IN ('urn:li:foo:1', 'urn:li:foo:2')";
     assertEquals(SQLStatementUtils.createAspectReadSql(AspectFoo.class, set, true, false), expectedSql);
+  }
+
+  @Test
+  public void testCreateMultiAspectReadSql() {
+    FooUrn fooUrn1 = makeFooUrn(1);
+    FooUrn fooUrn2 = makeFooUrn(2);
+    Set<Urn> urns = new LinkedHashSet<>();
+    urns.add(fooUrn1);
+    urns.add(fooUrn2);
+    Set<String> columns = new LinkedHashSet<>();
+    columns.add("a_aspectfoo");
+    columns.add("a_aspectbar");
+
+    // includeSoftDeleted=false: no JSON_EXTRACT, deleted_ts filter applied, no deleted_ts in SELECT
+    String expectedSql =
+        "SELECT urn, a_aspectfoo, a_aspectbar, lastmodifiedon, lastmodifiedby, createdfor "
+            + "FROM metadata_entity_foo "
+            + "WHERE urn IN ('urn:li:foo:1', 'urn:li:foo:2') "
+            + "AND deleted_ts IS NULL";
+    assertEquals(SQLStatementUtils.createMultiAspectReadSql(columns, urns, false, false), expectedSql);
+
+    // includeSoftDeleted=true: deleted_ts selected, no deleted_ts filter
+    expectedSql =
+        "SELECT urn, a_aspectfoo, a_aspectbar, lastmodifiedon, lastmodifiedby, createdfor, deleted_ts "
+            + "FROM metadata_entity_foo "
+            + "WHERE urn IN ('urn:li:foo:1', 'urn:li:foo:2')";
+    assertEquals(SQLStatementUtils.createMultiAspectReadSql(columns, urns, true, false), expectedSql);
+  }
+
+  @Test(expectedExceptions = IllegalArgumentException.class)
+  public void testCreateMultiAspectReadSqlEmptyUrns() {
+    Set<String> columns = new LinkedHashSet<>();
+    columns.add("a_aspectfoo");
+    SQLStatementUtils.createMultiAspectReadSql(columns, new LinkedHashSet<>(), false, false);
+  }
+
+  @Test(expectedExceptions = IllegalArgumentException.class)
+  public void testCreateMultiAspectReadSqlEmptyColumns() {
+    Set<Urn> urns = new LinkedHashSet<>();
+    urns.add(makeFooUrn(1));
+    SQLStatementUtils.createMultiAspectReadSql(new LinkedHashSet<>(), urns, false, false);
   }
 
   @Test
