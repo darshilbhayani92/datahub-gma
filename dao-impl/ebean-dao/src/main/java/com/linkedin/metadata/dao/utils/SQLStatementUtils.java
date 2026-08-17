@@ -239,6 +239,53 @@ public class SQLStatementUtils {
   }
 
   /**
+   * Create a single SQL statement to read multiple aspect columns for a set of URNs in one query.
+   * Unlike {@link #createAspectReadSql} (one SQL per aspect class), this selects all requested aspect
+   * columns at once. The gma_deleted check is NOT included in SQL - it is handled in Java by the caller
+   * (see {@code EBeanDAOUtils.readMultiAspectSqlRows}). All URNs must belong to the same entity type.
+   *
+   * @param aspectColumnNames aspect column names to select (e.g., "a_status", "a_ownership")
+   * @param urns URNs to query for
+   * @param includeSoftDeleted if true, omits deleted_ts IS NULL filter and includes deleted_ts in SELECT
+   * @param isTestMode whether to use the test table
+   * @return SQL string for the multi-aspect read
+   */
+  public static String createMultiAspectReadSql(@Nonnull Set<String> aspectColumnNames, @Nonnull Set<Urn> urns,
+      boolean includeSoftDeleted, boolean isTestMode) {
+    if (urns.isEmpty()) {
+      throw new IllegalArgumentException("Need at least 1 urn to query.");
+    }
+    if (aspectColumnNames.isEmpty()) {
+      throw new IllegalArgumentException("Need at least 1 aspect column to query.");
+    }
+
+    final Urn firstUrn = urns.iterator().next();
+    final String firstEntityType = firstUrn.getEntityType();
+    if (urns.stream().anyMatch(u -> !u.getEntityType().equals(firstEntityType))) {
+      throw new IllegalArgumentException("All URNs must belong to the same entity type");
+    }
+    final String tableName = isTestMode ? getTestTableName(firstUrn) : getTableName(firstUrn);
+
+    StringBuilder sb = new StringBuilder("SELECT urn, ");
+    sb.append(String.join(", ", aspectColumnNames));
+    sb.append(", lastmodifiedon, lastmodifiedby, createdfor");
+    if (includeSoftDeleted) {
+      sb.append(", deleted_ts");
+    }
+    sb.append(" FROM ").append(tableName);
+
+    String urnList = urns.stream()
+        .map(urn -> "'" + escapeReservedCharInUrn(urn.toString()) + "'")
+        .collect(Collectors.joining(", "));
+    sb.append(" WHERE urn IN (").append(urnList).append(")");
+
+    if (!includeSoftDeleted) {
+      sb.append(" AND ").append(DELETED_TS_IS_NULL_CHECK);
+    }
+    return sb.toString();
+  }
+
+  /**
    * List all the aspect record (0 or 1) for a given entity urn and aspect type.
    * @param aspectClass aspect type
    * @param urn entity urn

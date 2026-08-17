@@ -41,7 +41,10 @@ import java.nio.charset.StandardCharsets;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -559,6 +562,43 @@ public class EBeanDAOUtilsTest {
 
     // sanity test on JDBC functions
     assertNotNull(EBeanDAOUtils.getWithJdbc(fooUrn.toString(), fooAspect.getClass().getCanonicalName(), server, key));
+  }
+
+  @Test
+  public void testReadMultiAspectSqlRows() {
+    // A row with one populated aspect column (a_aspectfoo) and one null column (a_aspectbar).
+    // readMultiAspectSqlRows should skip the null column and return exactly 1 aspect.
+    AuditedAspect auditedAspect = new AuditedAspect();
+    auditedAspect.setCanonicalName(AspectFoo.class.getCanonicalName());
+    auditedAspect.setLastmodifiedby("urn:li:tester");
+    auditedAspect.setLastmodifiedon("2024-01-01 00:00:00.0");
+    AspectFoo aspectFoo = new AspectFoo();
+    aspectFoo.setValue("foo");
+    auditedAspect.setAspect(RecordUtils.toJsonString(aspectFoo));
+    String fooJson = EbeanLocalAccess.toJsonString(auditedAspect);
+
+    SqlRow sqlRow = mock(SqlRow.class);
+    when(sqlRow.getString("urn")).thenReturn("urn:li:foo:1");
+    when(sqlRow.get("a_aspectfoo")).thenReturn(fooJson);
+    when(sqlRow.getString("a_aspectfoo")).thenReturn(fooJson);
+    when(sqlRow.get("a_aspectbar")).thenReturn(null);
+    when(sqlRow.keySet()).thenReturn(new HashSet<>(Arrays.asList("urn", "a_aspectfoo", "a_aspectbar")));
+
+    Map<String, Class<AspectFoo>> columnMap = new LinkedHashMap<>();
+    columnMap.put("a_aspectfoo", AspectFoo.class);
+    columnMap.put("a_aspectbar", AspectFoo.class);
+
+    List<EbeanMetadataAspect> result =
+        EBeanDAOUtils.readMultiAspectSqlRows(Collections.singletonList(sqlRow), columnMap);
+    assertEquals(result.size(), 1);
+    assertEquals(result.get(0).getKey().getUrn(), "urn:li:foo:1");
+  }
+
+  @Test
+  public void testReadMultiAspectSqlRowsEmpty() {
+    Map<String, Class<AspectFoo>> columnMap = new LinkedHashMap<>();
+    columnMap.put("a_aspectfoo", AspectFoo.class);
+    assertEquals(EBeanDAOUtils.readMultiAspectSqlRows(Collections.<SqlRow>emptyList(), columnMap).size(), 0);
   }
 
   @Test
