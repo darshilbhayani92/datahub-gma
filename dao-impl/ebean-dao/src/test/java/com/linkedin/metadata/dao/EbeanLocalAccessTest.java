@@ -39,8 +39,10 @@ import java.sql.Timestamp;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.DataProvider;
@@ -147,6 +149,38 @@ public class EbeanLocalAccessTest {
 
     // Expect: get AspectFoo from urn:li:foo:9999 returns empty result
     assertTrue(ebeanMetadataAspectList.isEmpty());
+  }
+
+  @Test
+  public void testBatchGetUnionChunksOverMaxUrnsPerQuery() {
+    // A2 behavior: batchGetUnion collapses all requested aspects into a single multi-column SELECT,
+    // chunking the URN IN-clause by MAX_URNS_PER_QUERY (100). This verifies that when more than 100
+    // URNs are requested, every chunk is queried and all rows are returned (none lost or duplicated).
+    final int total = 150;
+    // Setup seeds foo URNs 0..99; add 100..149 so we cross the 100-URN chunk boundary (2 chunks).
+    for (int i = 100; i < total; i++) {
+      FooUrn fooUrn = makeFooUrn(i);
+      AspectFoo aspectFoo = new AspectFoo().setValue(String.valueOf(i));
+      AuditStamp auditStamp = makeAuditStamp("foo", System.currentTimeMillis());
+      _ebeanLocalAccessFoo.add(fooUrn, aspectFoo, AspectFoo.class, auditStamp, null, false);
+    }
+
+    final List<AspectKey<FooUrn, ? extends RecordTemplate>> keys = new ArrayList<>();
+    for (int i = 0; i < total; i++) {
+      keys.add(new AspectKey<>(AspectFoo.class, makeFooUrn(i), 0L));
+    }
+
+    // large keysCount so no within-call pagination; only URN-count chunking applies
+    final List<EbeanMetadataAspect> results = _ebeanLocalAccessFoo.batchGetUnion(keys, 1000, 0, false, false);
+
+    // all 150 rows returned across both chunks, one per distinct URN
+    assertEquals(results.size(), total);
+    final Set<String> returnedUrns = new HashSet<>();
+    for (EbeanMetadataAspect aspect : results) {
+      assertEquals(aspect.getKey().getAspect(), AspectFoo.class.getCanonicalName());
+      returnedUrns.add(aspect.getKey().getUrn());
+    }
+    assertEquals(returnedUrns.size(), total);
   }
 
   @Test
