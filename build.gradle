@@ -114,6 +114,10 @@ subprojects { sp ->
 
     tasks.withType(Test) {
       useTestNG()
+      // Forward the benchmark gate to the forked test JVM only when explicitly set (no-op otherwise).
+      if (System.getProperty('gma.benchmark') != null) {
+        systemProperty 'gma.benchmark', System.getProperty('gma.benchmark')
+      }
     }
 
     test {
