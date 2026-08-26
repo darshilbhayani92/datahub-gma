@@ -6,29 +6,34 @@ IN-clause chunking), tracked in [META-24100](https://linkedin.atlassian.net/brow
 
 ## What it measures
 
-`EbeanLocalAccessBenchmarkTest` measures, for a single `batchGetUnion` call:
+To exercise a production-representative aspect fanout (73 aspects on one entity, as in PR #622's Dataset example), the
+benchmark provisions a synthetic entity table with `NUM_ASPECTS` aspect columns (the shared test models expose only 2)
+and compares the two **real** SQL shapes in a single run:
+
+- **Old path** — one SELECT per aspect column, each with the `JSON_EXTRACT(col, '$.gma_deleted') IS NULL` soft-delete
+  filter, exactly as the pre-PR `SQLStatementUtils.createAspectReadSql` emits (replicated from
+  `SQL_READ_ASPECT_TEMPLATE`, since that builder requires a registered aspect class per column). ⇒ `NUM_ASPECTS`
+  round-trips.
+- **New path** — the actual `SQLStatementUtils.createMultiAspectReadSql` builder added by PR #622: one SELECT listing
+  all aspect columns, no `JSON_EXTRACT`. ⇒ 1 round-trip (per `MAX_URNS_PER_QUERY` chunk).
+
+For each path it reports:
 
 - **DB SELECT count** — read from MariaDB's per-session `Com_select` status counter (the connection is pinned inside a
-  transaction so the count reflects exactly the SELECTs the DAO issued for that one call).
+  transaction so the count reflects exactly the SELECTs that ran for one logical read). The "new = 1" figure is
+  therefore a measured value, not an assumption.
 - **Latency** — p50 / p90 / max over 200 iterations.
 
-The same test source compiles against both the old (N-query) and new (single-query) code, so you A/B by swapping the
-implementation between runs.
+## Local results (EmbeddedMariaDB, 50 URNs × 73 aspects = 3650 keys)
 
-> The local test models (`FooAsset`) expose only **2** aspect columns (`AspectFoo`, `AspectBar`). The local benchmark
-> therefore proves the **N → 1** collapse and relative latency win at small fanout. The production-scale story (e.g. 73
-> aspects → 1 query) is validated on EI (see below).
+| Path                                 | DB SELECTs / read | p50      | p90      | max      |
+| ------------------------------------ | ----------------- | -------- | -------- | -------- |
+| **Old** (1 SELECT per aspect column) | **73**            | 24.26 ms | 27.17 ms | 34.99 ms |
+| **New** (single multi-aspect SELECT) | **1**             | 1.60 ms  | 1.76 ms  | 2.03 ms  |
 
-## Local results (EmbeddedMariaDB, 50 URNs × 2 aspects = 100 keys)
-
-| Path                                 | DB SELECTs / call | latency p50 | latency p90 |
-| ------------------------------------ | ----------------- | ----------- | ----------- |
-| **Old** (1 SELECT per aspect class)  | **2**             | 2.47 ms     | 3.50 ms     |
-| **New** (single multi-aspect SELECT) | **1**             | 1.81 ms     | 2.31 ms     |
-
-At 2 aspects: SELECTs halved, p50 ~27% lower, p90 ~34% lower. The SELECT count is `#aspect-columns` for the old path vs
-`ceil(#URNs / 100)` for the new path — so the gap widens dramatically with aspect fanout (73 aspects → **73 SELECTs →
-1**).
+**73 → 1 SELECT, ~15× lower p50 (24.26 ms → 1.60 ms).** The SELECT count is `#aspect-columns` for the old path vs
+`ceil(#URNs / 100)` for the new path — so the win scales with aspect fanout. Absolute latency is not prod-representative
+(in-process DB, no network); production-scale latency is validated on EI (see below).
 
 ## How to run locally
 
@@ -45,24 +50,18 @@ Prerequisites (Apple Silicon):
    Then uncomment the three `configurationBuilder.set*` lines in `EmbeddedMariaInstance.java` (marked "M1 / M2 chip").
    **Local-only — do not commit.**
 
-Run the benchmark (skipped by default; enabled with `-Dgma.benchmark=true`):
+Run the benchmark (skipped by default; enabled with `-Dgma.benchmark=true`). Both the old and new SQL shapes are
+measured in a single run — no implementation swapping needed:
 
 ```bash
-# New code (this branch):
 ./gradlew :dao-impl:ebean-dao:test --tests '*EbeanLocalAccessBenchmarkTest*' -Dgma.benchmark=true
-
-# Old code baseline — swap in the pre-PR implementation, run, then restore:
-git show <base-commit>:dao-impl/ebean-dao/src/main/java/com/linkedin/metadata/dao/EbeanLocalAccess.java \
-  > dao-impl/ebean-dao/src/main/java/com/linkedin/metadata/dao/EbeanLocalAccess.java
-./gradlew :dao-impl:ebean-dao:test --tests '*EbeanLocalAccessBenchmarkTest*' -Dgma.benchmark=true
-git checkout -- dao-impl/ebean-dao/src/main/java/com/linkedin/metadata/dao/EbeanLocalAccess.java
 ```
 
 Results are printed to the test's captured stdout, e.g.:
 `build/test-results/test/TEST-com.linkedin.metadata.dao.EbeanLocalAccessBenchmarkTest.xml` (look for the `<system-out>`
 block), or in the HTML report under `build/reports/tests/test/`.
 
-Tune `NUM_URNS`, `WARMUP`, and `ITERATIONS` at the top of the test to model other batch sizes.
+Tune `NUM_ASPECTS`, `NUM_URNS`, `WARMUP`, and `ITERATIONS` at the top of the test to model other batch sizes.
 
 ## EI (QEI) testing — production-scale latency
 
