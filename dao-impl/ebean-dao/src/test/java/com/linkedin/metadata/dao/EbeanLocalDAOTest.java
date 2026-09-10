@@ -3395,6 +3395,70 @@ public class EbeanLocalDAOTest {
   }
 
   @Test
+  public void testGetWithSmallPageSizeNoDuplicatesNewSchema() {
+    // A3 pagination guard: in NEW_SCHEMA_ONLY, batchGetUnion fetches all latest-version aspects for
+    // the page in a single query at position=0, so the outer batchGet paging loop must not re-fetch on
+    // subsequent positions (position > 0 short-circuits). With a page size smaller than the number of
+    // requested keys, this verifies there are no duplicate/re-fetched rows and no missing records.
+    if (_schemaConfig == SchemaConfig.NEW_SCHEMA_ONLY) {
+      EbeanLocalDAO<EntityAspectUnion, FooUrn> dao = createDao(FooUrn.class);
+      dao.setAlwaysEmitAuditEvent(false);
+      dao.setAlwaysEmitAspectSpecificAuditEvent(false);
+      IngestionParams ingestionParams = new IngestionParams().setTestMode(false);
+
+      Set<AspectKey<FooUrn, ? extends RecordTemplate>> keys = new HashSet<>();
+      for (int i = 1; i <= 5; i++) {
+        FooUrn urn = makeFooUrn(i);
+        dao.add(urn, new AspectFoo().setValue("foo" + i), _dummyAuditStamp, null, ingestionParams);
+        keys.add(new AspectKey<>(AspectFoo.class, urn, 0L));
+      }
+
+      // page size (2) smaller than key count (5) forces multiple pages in batchGet()
+      dao.setQueryKeysCount(2);
+
+      Map<AspectKey<FooUrn, ? extends RecordTemplate>, Optional<? extends RecordTemplate>> result = dao.get(keys);
+
+      // exactly 5 present aspects: no duplicates from a position > 0 re-fetch, none missing
+      assertEquals(result.size(), 5);
+      for (AspectKey<FooUrn, ? extends RecordTemplate> key : keys) {
+        assertTrue(result.get(key).isPresent());
+      }
+    }
+  }
+
+  @Test
+  public void testGetWithSmallPageSizeNoDuplicatesDualSchema() {
+    // A3 DUAL_SCHEMA compare hoist: batchGetHelper returns the paginated old-schema results per page,
+    // while the cross-schema comparison is done once in batchGet() over the full key set. This verifies
+    // that hoisting the compare does not change the returned result: with a page size smaller than the
+    // number of latest-version keys, all records are returned with no duplicates and none missing.
+    if (_schemaConfig == SchemaConfig.DUAL_SCHEMA) {
+      EbeanLocalDAO<EntityAspectUnion, FooUrn> dao = createDao(FooUrn.class);
+      dao.setAlwaysEmitAuditEvent(false);
+      dao.setAlwaysEmitAspectSpecificAuditEvent(false);
+      IngestionParams ingestionParams = new IngestionParams().setTestMode(false);
+
+      Set<AspectKey<FooUrn, ? extends RecordTemplate>> keys = new HashSet<>();
+      for (int i = 1; i <= 5; i++) {
+        FooUrn urn = makeFooUrn(i);
+        dao.add(urn, new AspectFoo().setValue("foo" + i), _dummyAuditStamp, null, ingestionParams);
+        keys.add(new AspectKey<>(AspectFoo.class, urn, 0L));
+      }
+
+      // page size (2) smaller than key count (5) forces multiple pages in batchGet()
+      dao.setQueryKeysCount(2);
+
+      Map<AspectKey<FooUrn, ? extends RecordTemplate>, Optional<? extends RecordTemplate>> result = dao.get(keys);
+
+      // exactly 5 present aspects: paginated old-schema result is complete and de-duplicated
+      assertEquals(result.size(), 5);
+      for (AspectKey<FooUrn, ? extends RecordTemplate> key : keys) {
+        assertTrue(result.get(key).isPresent());
+      }
+    }
+  }
+
+  @Test
   public void testOptimisticLockException() {
     EbeanLocalDAO<EntityAspectUnion, FooUrn> dao = createDao(FooUrn.class);
     FooUrn fooUrn = makeFooUrn(1);
