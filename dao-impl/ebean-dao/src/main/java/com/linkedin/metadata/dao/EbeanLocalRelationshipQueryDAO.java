@@ -20,7 +20,9 @@ import io.ebean.config.ServerConfig;
 import com.linkedin.metadata.query.LocalRelationshipCriterion;
 import com.linkedin.metadata.query.LocalRelationshipCriterionArray;
 import com.linkedin.metadata.query.LocalRelationshipFilter;
+import com.linkedin.metadata.query.LocalRelationshipValue;
 import com.linkedin.metadata.query.RelationshipDirection;
+import com.linkedin.metadata.query.UrnField;
 import io.ebean.EbeanServer;
 import io.ebean.SqlQuery;
 import io.ebean.SqlRow;
@@ -62,6 +64,13 @@ public class EbeanLocalRelationshipQueryDAO {
   private static final String IDX_DESTINATION_DELETED_TS = "idx_destination_deleted_ts";
   private static final String FORCE_IDX_ON_DESTINATION = " FORCE INDEX (idx_destination_deleted_ts) ";
   private static final String DESTINATION_FIELD =  "destination";
+  private static final String IDX_SOURCE_DELETED_TS = "idx_source_deleted_ts";
+  private static final String FORCE_IDX_ON_SOURCE = " FORCE INDEX (idx_source_deleted_ts) ";
+  // The UrnField.name a source-pinning leaf carries. Deliberately separate from the public SOURCE
+  // constant above, which names a result-set column and a DataMap key rather than a filter field.
+  private static final String SOURCE_FIELD = "source";
+  // Default UrnField.name (see UrnField.pdl); a destination entity filter joined on dt.urn carries it.
+  private static final String URN_FIELD = "urn";
   private final EbeanServer _server;
   private final MultiHopsTraversalSqlGenerator _sqlGenerator;
 
@@ -69,7 +78,7 @@ public class EbeanLocalRelationshipQueryDAO {
 
   private Set<String> _mgEntityTypeNameSet;
   private EbeanLocalDAO.SchemaConfig _schemaConfig = EbeanLocalDAO.SchemaConfig.NEW_SCHEMA_ONLY;
-  private SchemaValidatorUtil _schemaValidatorUtil;
+  private final SchemaValidatorUtil _schemaValidatorUtil;
 
   public EbeanLocalRelationshipQueryDAO(EbeanServer server, ServerConfig serverConfig,
       EBeanDAOConfig eBeanDAOConfig) {
@@ -90,6 +99,19 @@ public class EbeanLocalRelationshipQueryDAO {
     _server = server;
     _eBeanDAOConfig = new EBeanDAOConfig();
     _schemaValidatorUtil = new SchemaValidatorUtil(server);
+    _sqlGenerator = new MultiHopsTraversalSqlGenerator(SUPPORTED_CONDITIONS, _schemaValidatorUtil);
+  }
+
+  /**
+   * Wires an explicit validator so tests can drive index presence without a live schema. Both the validator
+   * field and the SQL generator are built from the same instance, so the DAO is never left half-configured.
+   */
+  @VisibleForTesting
+  public EbeanLocalRelationshipQueryDAO(EbeanServer server, EBeanDAOConfig eBeanDAOConfig,
+      SchemaValidatorUtil schemaValidatorUtil) {
+    _server = server;
+    _eBeanDAOConfig = eBeanDAOConfig;
+    _schemaValidatorUtil = schemaValidatorUtil;
     _sqlGenerator = new MultiHopsTraversalSqlGenerator(SUPPORTED_CONDITIONS, _schemaValidatorUtil);
   }
 
@@ -290,8 +312,10 @@ public class EbeanLocalRelationshipQueryDAO {
    * LocalRelationshipFilter, int, int)} that walks the matching set in bounded pages. Ranked/
    * non-current pagination is unsupported because it could not bound the per-page DB work.
    *
-   * <p>First page: pass {@code cursor = null}; the DAO captures {@code maxId}, the largest
-   * relationship row id when paging starts ({@code COALESCE(MAX(id), 0)}), and returns rows with
+   * <p>First page: pass {@code cursor = null}. A result that fits inside one page is read with a
+   * single statement and reports {@code maxId} as the largest id it returned. Otherwise the DAO
+   * captures {@code maxId}, the largest relationship row id when paging starts
+   * ({@code COALESCE(MAX(id), 0)}), and returns rows with
    * {@code 0 < rt.id <= maxId} ordered by id, up to {@code pageSize}. Later inserts get larger ids
    * and are excluded, keeping the scan finite. Continuation: pass the next cursor from the previous
    * {@link RelationshipKeysetPage}. The cursor also carries a database scan-start timestamp. Later
@@ -356,8 +380,10 @@ public class EbeanLocalRelationshipQueryDAO {
    * Validates V4 logical-expression filters and the {@code wrapOptions} contract. Ranked/non-current
    * pagination is unsupported because it could not bound the per-page DB work.
    *
-   * <p>First page: pass {@code cursor = null}; the DAO captures {@code maxId}, the largest
-   * relationship row id when paging starts ({@code COALESCE(MAX(id), 0)}), and returns rows with
+   * <p>First page: pass {@code cursor = null}. A result that fits inside one page is read with a
+   * single statement and reports {@code maxId} as the largest id it returned. Otherwise the DAO
+   * captures {@code maxId}, the largest relationship row id when paging starts
+   * ({@code COALESCE(MAX(id), 0)}), and returns rows with
    * {@code 0 < rt.id <= maxId} ordered by id, up to {@code pageSize}. Continuation: pass the next
    * cursor from the previous {@link RelationshipKeysetPage}. The cursor also carries a database
    * scan-start timestamp. Later pages include rows that were current at scan start even if they were
@@ -437,6 +463,20 @@ public class EbeanLocalRelationshipQueryDAO {
           "Keyset pagination is only supported in NEW_SCHEMA_ONLY mode; OLD_SCHEMA_ONLY and DUAL_SCHEMA "
               + "(deprecated) are rejected.");
     }
+
+    // META-24388: most reads return far less than one page, and paging them costs three statements
+    // (scan start, current rows, rows deleted since scan start) where an unpaged read cost one.
+    // Probe with a single statement first. A short page proves the whole result was returned, so
+    // there is no second page to stay consistent with and the other two statements are unnecessary.
+    // A full page is inconclusive (there may or may not be more), so fall through and page properly.
+    if (cursor == null) {
+      final List<SqlRow> singleStatementRows = readWholeResultInOneStatement(relationshipTableName,
+          relationshipFilter, sourceTableName, sourceEntityFilter, destTableName, destinationEntityFilter, pageSize);
+      if (singleStatementRows != null) {
+        return new KeysetScanResult(singleStatementRows, largestIdOrZero(singleStatementRows), null);
+      }
+    }
+
     final long lastId;
     final long maxId;
     final String scanStartTime;
@@ -545,6 +585,76 @@ public class EbeanLocalRelationshipQueryDAO {
   }
 
   /**
+   * Rewrites an entity filter so it can be applied to the relationship table when the entity has no
+   * table of its own to join against.
+   *
+   * <p>An entity filter constrains the entity, and names its urn field after the entity rather than
+   * after the relationship column, so a caller filtering an asset on {@code urn} produces a criterion
+   * named {@code urn}. Applied verbatim to {@code rt} that renders {@code rt.urn}, which relationship
+   * tables do not have. The equivalent constraint on the relationship row is the column holding that
+   * urn, so the field is renamed to {@code relationshipColumn} and the condition and value are kept.</p>
+   *
+   * <p>Only ever called after {@link #validateEntityFilterOnlyOneUrn}, which guarantees a single
+   * criterion on a urn field.</p>
+   */
+  @Nonnull
+  private LocalRelationshipFilter entityFilterOnRelationshipColumn(
+      @Nonnull final LocalRelationshipFilter entityFilter, @Nonnull final String relationshipColumn) {
+    final LocalRelationshipCriterion urnCriterion =
+        flattenLogicalExpressionLocalRelationshipCriterion(entityFilter.getLogicalExpressionCriteria()).get(0);
+
+    final LocalRelationshipCriterion.Field renamedField = new LocalRelationshipCriterion.Field();
+    renamedField.setUrnField(new UrnField().setName(relationshipColumn));
+
+    final LocalRelationshipCriterion renamed = new LocalRelationshipCriterion()
+        .setField(renamedField)
+        .setValue(urnCriterion.getValue())
+        .setCondition(urnCriterion.getCondition());
+
+    return new LocalRelationshipFilter()
+        .setLogicalExpressionCriteria(wrapCriterionAsLogicalExpression(renamed));
+  }
+
+  /**
+   * Reads the entire result in one statement when it fits in a single page, or returns {@code null}
+   * when it does not and the caller must fall back to paging.
+   *
+   * <p>Bounding by {@code Long.MAX_VALUE} rather than the scan's real {@code maxId} is what avoids
+   * the scan-start query: that bound exists only to keep multiple pages consistent with each other by
+   * excluding rows inserted mid-scan, and a single statement has no second page to be consistent
+   * with. The companion query for rows soft-deleted since scan start is unnecessary for the same
+   * reason, since one statement reads one snapshot. The result is the same shape the unpaged read
+   * returned before keyset pagination was introduced.</p>
+   *
+   * <p>A full page is treated as inconclusive rather than complete. The row count alone cannot
+   * distinguish a result that is exactly one page long from one that is longer. Reading
+   * {@code pageSize + 1} rows would tell them apart, but only below the maximum page size, since at
+   * the maximum it exceeds the bound the SQL builder enforces. Rather than have the fast path work
+   * for some page sizes and not others, the ambiguous case pages instead. Guessing wrong here would
+   * silently drop rows, and an exactly-full page is the rare case.</p>
+   *
+   * @return the complete result, or {@code null} when it did not fit in one page
+   */
+  @Nullable
+  private List<SqlRow> readWholeResultInOneStatement(@Nonnull final String relationshipTableName,
+      @Nonnull final LocalRelationshipFilter relationshipFilter, @Nullable final String sourceTableName,
+      @Nullable final LocalRelationshipFilter sourceEntityFilter, @Nullable final String destTableName,
+      @Nullable final LocalRelationshipFilter destinationEntityFilter, final int pageSize) {
+    final String sql = buildFindRelationshipKeysetCurrentSQL(relationshipTableName, relationshipFilter,
+        sourceTableName, sourceEntityFilter, destTableName, destinationEntityFilter, pageSize, 0L, Long.MAX_VALUE);
+    final List<SqlRow> rows = executeSqlWithIndexCheck(sql, relationshipTableName);
+    return rows.size() < pageSize ? rows : null;
+  }
+
+  /**
+   * Largest {@code id} among {@code rows}, which are in ascending id order, or 0 when empty. Used as
+   * the reported {@code maxId} for a single-statement read, where no separate scan-start query ran.
+   */
+  private static long largestIdOrZero(@Nonnull final List<SqlRow> rows) {
+    return rows.isEmpty() ? 0L : rows.get(rows.size() - 1).getLong("id");
+  }
+
+  /**
    * Immutable holder for one keyset scan's largest row id and database start time.
    */
   private static final class KeysetScanStart {
@@ -608,6 +718,7 @@ public class EbeanLocalRelationshipQueryDAO {
     final String sql =
         "SELECT COALESCE(MAX(id), 0) AS max_id, DATE_FORMAT(NOW(6), '%Y-%m-%d %H:%i:%s.%f') AS scan_start_time FROM "
             + relationshipTableName;
+    beforeRelationshipQueryExecuted(sql);
     // Aggregate without GROUP BY, so this always yields exactly one row.
     final SqlRow row = _server.createSqlQuery(sql).findOne();
     return new KeysetScanStart(row.getLong("max_id"), row.getString("scan_start_time"));
@@ -1130,18 +1241,24 @@ public class EbeanLocalRelationshipQueryDAO {
         // non-mg entity case, applying dest filter on relationship table
         filters.add(new Triplet<>(destinationEntityFilter, "rt", relationshipTableName));
       } else if (filterHasNonEmptyCriteria(relationshipFilter)) {
-        // Apply FORCE INDEX if destination field is being filtered, and the index exists
+        // Apply FORCE INDEX if the destination or source field is being filtered, and the index exists.
+        // This branch is reached only when no destination entity join was appended, so the hint still lands
+        // directly after "FROM <table> rt" and ahead of the source join added below.
         final LocalRelationshipCriterionArray relationshipCriteria =
             flattenLogicalExpressionLocalRelationshipCriterion(relationshipFilter.getLogicalExpressionCriteria());
-        for (LocalRelationshipCriterion criterion : relationshipCriteria) {
-          LocalRelationshipCriterion.Field field = criterion.getField();
-          if (field.getUrnField() != null && DESTINATION_FIELD.equals(field.getUrnField().getName())) {
-            // Check if index exists on 'destination' before applying FORCE INDEX
-            if (_schemaValidatorUtil.indexExists(relationshipTableName, IDX_DESTINATION_DELETED_TS)) {
-              sqlBuilder.append(FORCE_IDX_ON_DESTINATION);
-            }
-            break;
-          }
+        // Destination takes precedence, so a query pinning both sides is hinted on the destination.
+        // The source arm is reached when the destination is not pinned, or is pinned but its index is
+        // absent, matching the keyset builder's else-if.
+        //
+        // The destination arm matches on field name alone, which also hints shapes that do not pin the
+        // column to one value, such as a negated or multi-value leaf. That predates this method and is
+        // left alone so currently hinted queries keep their plan. The source arm is new, so it uses the
+        // stricter rule the keyset builder applies rather than inheriting that looseness.
+        if (!appendUrnFieldIndexHint(sqlBuilder, relationshipCriteria, relationshipTableName, DESTINATION_FIELD,
+            IDX_DESTINATION_DELETED_TS, FORCE_IDX_ON_DESTINATION)
+            && pinsUrnFieldToOneValue(relationshipFilter, SOURCE_FIELD)
+            && _schemaValidatorUtil.indexExists(relationshipTableName, IDX_SOURCE_DELETED_TS)) {
+          sqlBuilder.append(FORCE_IDX_ON_SOURCE);
         }
       }
 
@@ -1151,6 +1268,12 @@ public class EbeanLocalRelationshipQueryDAO {
         if (sourceEntityFilter != null) {
           filters.add(new Triplet<>(sourceEntityFilter, "st", sourceTableName));
         }
+      } else if (filterHasNonEmptyCriteria(sourceEntityFilter)) {
+        validateEntityFilterOnlyOneUrn(sourceEntityFilter);
+        // non-mg entity case, applying source filter on relationship table. See the keyset builder
+        // for why this is gated on non-empty criteria rather than non-null.
+        filters.add(new Triplet<>(entityFilterOnRelationshipColumn(sourceEntityFilter, SOURCE_FIELD),
+            "rt", relationshipTableName));
       }
 
       if (!includeNonCurrentRelationships) {
@@ -1283,6 +1406,44 @@ public class EbeanLocalRelationshipQueryDAO {
     sqlBuilder.append("SELECT rt.*");
     sqlBuilder.append(" FROM ").append(relationshipTableName).append(" rt ");
 
+    // META-24159: force idx_destination_deleted_ts when the query pins rt.destination to exactly one urn.
+    // InnoDB suffixes secondary indexes with the PK id, so (destination, deleted_ts) also satisfies
+    // ORDER BY rt.id ASC without a filesort. Joins/filters are always retained; the hint fires only when
+    // the index exists.
+    //
+    // Which filter pins the destination depends on the call shape, so all three are considered here rather
+    // than at the branch that happens to render each one. A caller that passes no destination entity class and
+    // an empty destination entity filter still pins the destination through the relationship filter, which is
+    // how reverse-lineage reads arrive.
+    final boolean destinationPinnedToOneUrn = destTableName != null
+        ? pinsUrnFieldToOneValue(destinationEntityFilter, URN_FIELD)
+        : pinsUrnFieldToOneValue(destinationEntityFilter, DESTINATION_FIELD)
+            || pinsUrnFieldToOneValue(relationshipFilter, DESTINATION_FIELD);
+
+    // META-24386: the mirror image on the source side. Forward-lineage reads pin rt.source, and the source
+    // index keeps them off the PRIMARY scan this hint exists to avoid.
+    //
+    // The same three shapes the destination has. When sourceTableName is null the source entity filter is
+    // rendered against rt, so it pins the source there just as the relationship filter does. An entity
+    // filter names its urn field after the entity rather than the relationship column, so either name
+    // qualifies; entityFilterOnRelationshipColumn renames it when the predicate is rendered.
+    final boolean sourcePinnedToOneUrn = sourceTableName != null
+        ? pinsUrnFieldToOneValue(sourceEntityFilter, URN_FIELD)
+        : pinsUrnFieldToOneValue(sourceEntityFilter, SOURCE_FIELD)
+            || pinsUrnFieldToOneValue(sourceEntityFilter, URN_FIELD)
+            || pinsUrnFieldToOneValue(relationshipFilter, SOURCE_FIELD);
+
+    // Only one FORCE INDEX can be emitted, so a query pinning both sides has to pick. Destination wins:
+    // it is the path already validated in production, so every currently hinted query stays byte identical.
+    // A both-pinned query selects the edges between one specific pair and is narrow under either index.
+    if (destinationPinnedToOneUrn
+        && _schemaValidatorUtil.indexExists(relationshipTableName, IDX_DESTINATION_DELETED_TS)) {
+      sqlBuilder.append(FORCE_IDX_ON_DESTINATION);
+    } else if (sourcePinnedToOneUrn
+        && _schemaValidatorUtil.indexExists(relationshipTableName, IDX_SOURCE_DELETED_TS)) {
+      sqlBuilder.append(FORCE_IDX_ON_SOURCE);
+    }
+
     final List<Triplet<LocalRelationshipFilter, String, String>> filters = new ArrayList<>();
 
     if (_schemaConfig == EbeanLocalDAO.SchemaConfig.NEW_SCHEMA_ONLY) {
@@ -1303,6 +1464,15 @@ public class EbeanLocalRelationshipQueryDAO {
         if (sourceEntityFilter != null) {
           filters.add(new Triplet<>(sourceEntityFilter, "st", sourceTableName));
         }
+      } else if (filterHasNonEmptyCriteria(sourceEntityFilter)) {
+        validateEntityFilterOnlyOneUrn(sourceEntityFilter);
+        // non-mg entity case, applying source filter on relationship table. Gated on non-empty
+        // criteria rather than non-null because validateEntityFilterOnlyOneUrn reads the first
+        // criterion without a size check, so an empty logical-expression filter would fail there,
+        // and an empty filter contributes nothing to the WHERE clause in any case. The destination
+        // arm above gates on non-null and carries that hazard.
+        filters.add(new Triplet<>(entityFilterOnRelationshipColumn(sourceEntityFilter, SOURCE_FIELD),
+            "rt", relationshipTableName));
       }
 
       filters.add(new Triplet<>(relationshipFilter, "rt", relationshipTableName));
@@ -1327,6 +1497,116 @@ public class EbeanLocalRelationshipQueryDAO {
   }
 
   /**
+   * Appends {@code forceIndexClause} to {@code sqlBuilder} when {@code criteria} contains a urn leaf named
+   * {@code urnFieldName} and {@code indexName} exists on {@code relationshipTableName}.
+   *
+   * <p>Returns whether the clause was appended, so a caller chaining destination then source falls through
+   * to the source arm when the destination index is absent. That matches the keyset builder, where the
+   * equivalent {@code else if} is reached for the same reason.</p>
+   */
+  private boolean appendUrnFieldIndexHint(@Nonnull final StringBuilder sqlBuilder,
+      @Nonnull final LocalRelationshipCriterionArray criteria, @Nonnull final String relationshipTableName,
+      @Nonnull final String urnFieldName, @Nonnull final String indexName,
+      @Nonnull final String forceIndexClause) {
+    for (LocalRelationshipCriterion criterion : criteria) {
+      final LocalRelationshipCriterion.Field field = criterion.getField();
+      if (field.getUrnField() != null && urnFieldName.equals(field.getUrnField().getName())) {
+        if (_schemaValidatorUtil.indexExists(relationshipTableName, indexName)) {
+          sqlBuilder.append(forceIndexClause);
+          return true;
+        }
+        return false;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Whether {@code filter} constrains {@code expectedUrnFieldName} to exactly one urn value, making the
+   * {@code idx_destination_deleted_ts} (META-24159) or {@code idx_source_deleted_ts} (META-24386) hint
+   * safe to emit.
+   *
+   * <p>A bare urn leaf qualifies, and so does a urn leaf nested anywhere inside a tree of {@code AND}
+   * groups: every conjunct has to hold, so one conjunct pinning the urn pins it for the whole expression
+   * and the remaining conjuncts only narrow the row set further. A lineage read that also filters on
+   * relationship type arrives in exactly that shape.</p>
+   *
+   * <p>{@code OR}, {@code NOT} and unspecified operators are not descended into. A row can satisfy an
+   * {@code OR} without matching the urn predicate at all, so the index would no longer cover the query,
+   * and a negated predicate pins nothing.</p>
+   *
+   * <p>{@code expectedUrnFieldName} is {@code "destination"} or {@code "source"} for the relationship
+   * filter, and {@code "urn"} for an entity filter rendered against a joined table.</p>
+   */
+  private boolean pinsUrnFieldToOneValue(@Nullable final LocalRelationshipFilter filter,
+      @Nonnull final String expectedUrnFieldName) {
+    if (filter == null || !filter.hasLogicalExpressionCriteria()) {
+      return false;
+    }
+    return pinsUrnFieldToOneValue(filter.getLogicalExpressionCriteria(), expectedUrnFieldName);
+  }
+
+  private boolean pinsUrnFieldToOneValue(@Nonnull final LogicalExpressionLocalRelationshipCriterion node,
+      @Nonnull final String expectedUrnFieldName) {
+    if (!node.hasExpr()) {
+      return false;
+    }
+
+    final LogicalExpressionLocalRelationshipCriterion.Expr expr = node.getExpr();
+    if (expr.isCriterion()) {
+      return isSingleUrnLeafCriterion(expr.getCriterion(), expectedUrnFieldName);
+    }
+
+    // An expr union with neither member set is representable, and getLogical() returns null for it,
+    // so this cannot be inferred from isCriterion() alone. Flattening skips such a node rather than
+    // failing, so the filter reaches here and must be treated as pinning nothing.
+    if (!expr.isLogical()) {
+      return false;
+    }
+
+    final LogicalOperation operation = expr.getLogical();
+    if (operation.getOp() != Operator.AND) {
+      return false;
+    }
+
+    for (LogicalExpressionLocalRelationshipCriterion child : operation.getExpressions()) {
+      if (pinsUrnFieldToOneValue(child, expectedUrnFieldName)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Whether {@code leaf} is a urn criterion named {@code expectedUrnFieldName} that pins it to exactly one
+   * value ({@code urn EQUAL '<value>'} as a scalar string, or {@code urn IN ('<value>')} as a one-element
+   * array). A non-urn field, a differently named urn field, a multi-value {@code IN}, a scalar {@code IN},
+   * a non-scalar {@code EQUAL}, or any other condition is ineligible. Pinning to one value is what lets the
+   * composite index also satisfy {@code ORDER BY rt.id ASC}, since the id suffix is ordered only within a
+   * single leading-column value.
+   */
+  private boolean isSingleUrnLeafCriterion(@Nonnull final LocalRelationshipCriterion leaf,
+      @Nonnull final String expectedUrnFieldName) {
+    if (!leaf.getField().isUrnField()) {
+      return false;
+    }
+
+    if (!expectedUrnFieldName.equals(leaf.getField().getUrnField().getName())) {
+      return false;
+    }
+
+    final LocalRelationshipValue value = leaf.getValue();
+    switch (leaf.getCondition()) {
+      case EQUAL:
+        return value.isString();
+      case IN:
+        return value.isArray() && value.getArray().size() == 1;
+      default:
+        return false;
+    }
+  }
+
+  /**
    * Creates and return a set of MG entity type names by querying the database.
    */
   public Set<String> initMgEntityTypeNameSet() {
@@ -1344,7 +1624,19 @@ public class EbeanLocalRelationshipQueryDAO {
     return _mgEntityTypeNameSet;
   }
 
+  /**
+   * Invoked immediately before each relationship read is sent to the database. A no-op in
+   * production; tests override it to count how many reads a call actually costs, which is a
+   * behaviour worth pinning because the point of the single-statement fast path is to reduce that
+   * count. Counting SQL construction instead would miss reads whose SQL is not built by the
+   * relationship SQL builders, such as the keyset scan-start query.
+   */
+  protected void beforeRelationshipQueryExecuted(@Nonnull String sql) {
+    // No-op seam.
+  }
+
   private List<SqlRow> executeSqlWithIndexCheck(String sql, String relationshipTableName) {
+    beforeRelationshipQueryExecuted(sql);
     try {
       return _server.createSqlQuery(sql).findList();
     } catch (PersistenceException e) {
@@ -1355,6 +1647,7 @@ public class EbeanLocalRelationshipQueryDAO {
 
   private List<SqlRow> executeSqlWithIndexCheck(String sql, String relationshipTableName,
       @Nonnull String scanStartTime) {
+    beforeRelationshipQueryExecuted(sql);
     try {
       SqlQuery query = _server.createSqlQuery(sql);
       query.setParameter("scanStartTime", scanStartTime);
