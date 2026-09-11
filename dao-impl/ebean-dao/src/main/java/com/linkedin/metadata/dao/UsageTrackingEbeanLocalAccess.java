@@ -162,6 +162,20 @@ public class UsageTrackingEbeanLocalAccess<URN extends Urn> implements IEbeanLoc
 
   @Nonnull
   @Override
+  public <ASPECT extends RecordTemplate> List<EbeanMetadataAspect> batchGetUnionMultiAspect(
+      @Nonnull List<AspectKey<URN, ? extends RecordTemplate>> keys, int keysCount, int position,
+      boolean includeSoftDeleted, boolean isTestMode) {
+    final List<EbeanMetadataAspect> result =
+        _delegate.batchGetUnionMultiAspect(keys, keysCount, position, includeSoftDeleted, isTestMode);
+    if (emissionEnabled() && !isTestMode && !DaoReadContext.isInternalRead()) {
+      emitRead("batchGetUnionMultiAspect", () -> entityTypeFromKeys(keys, keysCount, position),
+          () -> targetsFromKeys(keys, keysCount, position));
+    }
+    return result;
+  }
+
+  @Nonnull
+  @Override
   public <ASPECT extends RecordTemplate> ListResult<ASPECT> list(@Nonnull Class<ASPECT> aspectClass,
       @Nonnull URN urn, int start, int pageSize) {
     final ListResult<ASPECT> result = _delegate.list(aspectClass, urn, start, pageSize);

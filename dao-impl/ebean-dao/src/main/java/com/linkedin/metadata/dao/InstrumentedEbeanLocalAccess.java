@@ -142,6 +142,15 @@ public class InstrumentedEbeanLocalAccess<URN extends Urn> implements IEbeanLoca
         () -> _delegate.batchGetUnion(keys, keysCount, position, includeSoftDeleted, isTestMode));
   }
 
+  @Nonnull
+  @Override
+  public <ASPECT extends RecordTemplate> List<EbeanMetadataAspect> batchGetUnionMultiAspect(
+      @Nonnull List<AspectKey<URN, ? extends RecordTemplate>> keys, int keysCount, int position,
+      boolean includeSoftDeleted, boolean isTestMode) {
+    return instrument("batchGetUnionMultiAspect", null, bucketCount(keys.size()),
+        () -> _delegate.batchGetUnionMultiAspect(keys, keysCount, position, includeSoftDeleted, isTestMode));
+  }
+
   @Override
   public int softDeleteAsset(@Nonnull URN urn, boolean isTestMode) {
     return instrument("softDeleteAsset", null, null,

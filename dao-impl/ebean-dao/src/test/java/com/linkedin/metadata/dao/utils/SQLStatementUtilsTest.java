@@ -155,6 +155,31 @@ public class SQLStatementUtilsTest {
   }
 
   @Test
+  public void testCreateMultiAspectReadSql() {
+    FooUrn fooUrn1 = makeFooUrn(1);
+    FooUrn fooUrn2 = makeFooUrn(2);
+    Set<Urn> urns = new java.util.LinkedHashSet<>();
+    urns.add(fooUrn1);
+    urns.add(fooUrn2);
+    List<String> columns = java.util.Arrays.asList("a_aspectfoo", "a_aspectbar");
+
+    // includeSoftDeleted=false: one bundled SELECT over all columns, row-level deleted_ts filter only.
+    String expectedSql =
+        "SELECT urn, a_aspectfoo, a_aspectbar, lastmodifiedon, lastmodifiedby "
+            + "FROM metadata_entity_foo "
+            + "WHERE urn IN ('urn:li:foo:1', 'urn:li:foo:2') "
+            + "AND deleted_ts IS NULL";
+    assertEquals(SQLStatementUtils.createMultiAspectReadSql(urns, columns, false, false), expectedSql);
+
+    // includeSoftDeleted=true: also SELECT deleted_ts and drop the deleted_ts filter.
+    expectedSql =
+        "SELECT urn, a_aspectfoo, a_aspectbar, lastmodifiedon, lastmodifiedby, deleted_ts "
+            + "FROM metadata_entity_foo "
+            + "WHERE urn IN ('urn:li:foo:1', 'urn:li:foo:2')";
+    assertEquals(SQLStatementUtils.createMultiAspectReadSql(urns, columns, true, false), expectedSql);
+  }
+
+  @Test
   public void testCreateFilterSql() {
 
     IndexFilter indexFilter = new IndexFilter();
