@@ -1507,13 +1507,26 @@ public class EbeanLocalDAO<ASPECT_UNION extends UnionTemplate, URN extends Urn>
   }
 
   /**
-   * Executes a new-schema batch read. Extracted as the single routing seam for new-schema reads; the
-   * configurable multi-aspect strategy is wired in a follow-up PR. Currently always uses the per-aspect
-   * path (one SELECT per aspect), preserving existing behavior.
+   * Executes a new-schema batch read using the configured {@link AspectReadStrategy}: per-aspect
+   * (one SELECT per aspect), multi-aspect (one bundled SELECT per table), or dual (run both and compare,
+   * returning the per-aspect result as the safe source of truth).
    */
   private List<EbeanMetadataAspect> newSchemaBatchGet(@Nonnull List<AspectKey<URN, ? extends RecordTemplate>> keys,
       int keysCount, int position) {
-    return _localAccess.batchGetUnion(keys, keysCount, position, false, false);
+    switch (_aspectReadStrategy) {
+      case MULTI_ASPECT:
+        return _localAccess.batchGetUnionMultiAspect(keys, keysCount, position, false, false);
+      case DUAL:
+        final List<EbeanMetadataAspect> perAspect =
+            _localAccess.batchGetUnion(keys, keysCount, position, false, false);
+        final List<EbeanMetadataAspect> multiAspect =
+            _localAccess.batchGetUnionMultiAspect(keys, keysCount, position, false, false);
+        EBeanDAOUtils.compareResults(perAspect, multiAspect, "batchGetMultiAspect");
+        return perAspect;
+      case PER_ASPECT:
+      default:
+        return _localAccess.batchGetUnion(keys, keysCount, position, false, false);
+    }
   }
 
   /**

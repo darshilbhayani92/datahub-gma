@@ -39,8 +39,10 @@ import java.sql.Timestamp;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.DataProvider;
@@ -160,6 +162,46 @@ public class EbeanLocalAccessTest {
     // Then: expect it to be silently skipped (no exception) and return empty result
     assertNotNull(result);
     assertTrue("Expected empty result when aspect column is missing", result.isEmpty());
+  }
+
+  @Test
+  public void testBatchGetUnionMultiAspectMatchesPerAspect() {
+    // Given: an entity with two aspects written (foo + bar), forcing the per-aspect path to issue 2 SELECTs
+    FooUrn fooUrn = makeFooUrn(400);
+    AspectFoo foo = new AspectFoo().setValue("foo_400");
+    AspectBar bar = new AspectBar().setValue("bar_400");
+    List<BaseLocalDAO.AspectUpdateContext<RecordTemplate>> updateContexts = Arrays.asList(
+        new BaseLocalDAO.AspectUpdateContext<>(null, foo, new BaseLocalDAO.AspectUpdateLambda<>(foo)),
+        new BaseLocalDAO.AspectUpdateContext<>(null, bar, new BaseLocalDAO.AspectUpdateLambda<>(bar))
+    );
+    _ebeanLocalAccessFoo.batchUpsert(fooUrn, updateContexts, makeAuditStamp("actor", _now), null, false);
+
+    // Also include a non-existent urn and a missing-column aspect to exercise skip semantics.
+    FooUrn nonExistUrn = makeFooUrn(9998);
+    List<AspectKey<FooUrn, ? extends RecordTemplate>> keys = Arrays.asList(
+        new AspectKey<>(AspectFoo.class, fooUrn, 0L),
+        new AspectKey<>(AspectBar.class, fooUrn, 0L),
+        new AspectKey<>(AspectBaz.class, fooUrn, 0L),   // column does not exist -> skipped
+        new AspectKey<>(AspectFoo.class, nonExistUrn, 0L) // no row -> skipped
+    );
+
+    // When: reading via the per-aspect path and the multi-aspect path
+    List<EbeanMetadataAspect> perAspect =
+        _ebeanLocalAccessFoo.batchGetUnion((List) keys, keys.size(), 0, false, false);
+    List<EbeanMetadataAspect> multiAspect =
+        _ebeanLocalAccessFoo.batchGetUnionMultiAspect((List) keys, keys.size(), 0, false, false);
+
+    // Then: both paths return the same set of aspects
+    assertEquals(normalize(multiAspect), normalize(perAspect));
+    assertEquals(2, multiAspect.size());
+  }
+
+  private static Set<String> normalize(List<EbeanMetadataAspect> aspects) {
+    Set<String> normalized = new HashSet<>();
+    for (EbeanMetadataAspect a : aspects) {
+      normalized.add(a.getKey().getUrn() + "|" + a.getKey().getAspect() + "|" + a.getMetadata());
+    }
+    return normalized;
   }
 
   @Test
